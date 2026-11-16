@@ -1,0 +1,11 @@
+{
+  "name": "lojinha-klubi",
+  "private": true,
+  "scripts": {
+    "frontend:dev": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build",
+    "frontend:lint": "npm --prefix frontend run lint",
+    "backend:dev": "python -m backend.app.main",
+    "test": "python -m unittest discover -s backend/tests -v"
+  }
+}

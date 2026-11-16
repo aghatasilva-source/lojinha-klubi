@@ -1,0 +1,29 @@
+.tools/
+node_modules/
+frontend/.next/
+frontend/out/
+backend/.venv/
+backend/data/
+__pycache__/
+*.pyc
+.env
+.env.local
+.env.*
+!.env.example
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Credenciais e planilhas operacionais
+sheets.json
+*.xlsx
+idsheets.txt
+/LOG
+/auxiliar vicenzo
+/criação_site.md
+/DOCUMENTACAO_TECNICA.md
+/instruções tecnicas.md
+/frontend/.env.local
+/frontend/AGENTS.md
+/frontend/CLAUDE.md
