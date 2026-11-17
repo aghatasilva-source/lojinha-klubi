@@ -53,6 +53,17 @@ class Settings:
     clerk_secret_key: str = os.getenv("CLERK_SECRET_KEY", "")
     clerk_authorized_parties: tuple[str, ...] = tuple(origin.strip().rstrip("/") for origin in os.getenv("CLERK_AUTHORIZED_PARTIES", "http://localhost:3000,http://127.0.0.1:3000").split(",") if origin.strip())
     clerk_workspace_domain: str = os.getenv("CLERK_WORKSPACE_DOMAIN", "example.com").lower()
+    # Endereço em que a API escuta. No servidor, use 0.0.0.0 (ou deixe 127.0.0.1 atrás de um proxy reverso).
+    api_host: str = os.getenv("API_HOST", "127.0.0.1")
+    api_port: int = int(os.getenv("API_PORT", "8000"))
+    # Fotos dos produtos enviadas pelo painel. Fica fora do repositório, como o banco.
+    images_dir: Path = _path(os.getenv("IMAGES_DIR", "backend/data/imagens"))
+    # Sites que podem chamar a API pelo navegador (CORS): a interface e as origens autorizadas do Clerk.
+    allowed_origins: tuple[str, ...] = tuple(dict.fromkeys(
+        origin.strip().rstrip("/")
+        for origin in [os.getenv("FRONTEND_URL", "http://localhost:3000"), *os.getenv("CLERK_AUTHORIZED_PARTIES", "http://localhost:3000,http://127.0.0.1:3000").split(",")]
+        if origin.strip()
+    ))
 
 
 settings = Settings()

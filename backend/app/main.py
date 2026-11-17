@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -42,6 +41,10 @@ from .services import (
     seed_catalog_from_xlsx,
     sync_google_orders,
     create_store_order,
+    list_product_images,
+    product_image_file,
+    remove_product_image,
+    save_product_image,
 )
 
 
@@ -54,13 +57,25 @@ def json_response(handler: BaseHTTPRequestHandler, payload: object, status: int 
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     origin = handler.headers.get("Origin", "")
-    if origin in {"http://localhost:3000", "http://127.0.0.1:3000"}:
+    if origin in settings.allowed_origins:
         handler.send_header("Access-Control-Allow-Origin", origin)
         handler.send_header("Vary", "Origin")
         handler.send_header("Access-Control-Allow-Credentials", "true")
     handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Token, X-User-Role, X-Idempotency-Key, X-Request-Id")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header("X-Request-Id", getattr(handler, "request_id", ""))
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def file_response(handler: BaseHTTPRequestHandler, path, content_type: str) -> None:
+    body = path.read_bytes()
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    # O nome do arquivo muda a cada envio, então a foto pode ficar em cache por bastante tempo.
+    handler.send_header("Cache-Control", "public, max-age=31536000, immutable")
+    handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
@@ -81,12 +96,15 @@ def csv_response(handler: BaseHTTPRequestHandler, content: str, filename: str) -
     handler.send_header("Content-Type", "text/csv; charset=utf-8")
     handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
     origin = handler.headers.get("Origin", "")
-    if origin in {"http://localhost:3000", "http://127.0.0.1:3000"}:
+    if origin in settings.allowed_origins:
         handler.send_header("Access-Control-Allow-Origin", origin)
         handler.send_header("Vary", "Origin")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+MAX_BODY_BYTES = 6 * 1024 * 1024  # foto de até 3 MB em base64, com folga
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -99,7 +117,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.request_id = self.headers.get("X-Request-Id") or str(uuid.uuid4())
 
     def _body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > MAX_BODY_BYTES:
+            raise ValueError("O envio é grande demais. Fotos devem ter no máximo 3 MB.")
         return json.loads(self.rfile.read(length) or b"{}")
 
     def _session(self) -> dict | None:
@@ -162,10 +182,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                     if not self._authorized({"ADMINISTRADOR"}): return
                     identity = {"email": ""}
                 return json_response(self, {"items": list_store_orders(identity["email"])})
+            match = re.fullmatch(r"/api/imagens/([^/]+)", path)
+            if match:
+                found = product_image_file(match.group(1))
+                if not found: return json_response(self, {"detail": "Foto não encontrada."}, 404)
+                return file_response(self, *found)
             if path == "/api/saude": return json_response(self, {"status": "ok", "aplicacao": "LOJINHA KLUBI", "hora": utc_now()})
             if not self._authorized({"ADMINISTRADOR", "OPERACAO", "CONSULTA"}): return
             if path == "/api/dashboard": return json_response(self, dashboard())
             if path == "/api/produtos": return json_response(self, list_products(_int(query, "page", 1), _int(query, "page_size", 50), _bool(query, "baixo")))
+            if path == "/api/produtos/imagens": return json_response(self, list_product_images())
             if path == "/api/estoque/baixo": return json_response(self, list_products(_int(query, "page", 1), _int(query, "page_size", 50), True))
             if path == "/api/estoque/importar":
                 if not self._authorized({"ADMINISTRADOR", "OPERACAO"}): return
@@ -251,6 +277,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/api/estoque/importar":
                 if not self._authorized({"ADMINISTRADOR", "OPERACAO"}): return
                 return json_response(self, import_current_stock(), 201)
+            if path == "/api/produtos/imagem":
+                if not self._authorized({"ADMINISTRADOR", "OPERACAO"}): return
+                payload = self._body()
+                return json_response(self, save_product_image(str(payload.get("base_name", "")), str(payload.get("image", ""))), 201)
+            if path == "/api/produtos/imagem/remover":
+                if not self._authorized({"ADMINISTRADOR", "OPERACAO"}): return
+                payload = self._body()
+                return json_response(self, remove_product_image(str(payload.get("base_name", ""))))
             match = re.fullmatch(r"/api/estoque/(\d+)/ajustar", path)
             if match:
                 if not self._authorized({"ADMINISTRADOR"}): return
@@ -313,8 +347,8 @@ def main() -> None:
                 logger.exception("falha na sincronização periódica")
 
     threading.Thread(target=sync_loop, name="sincronizacao-google-sheets", daemon=True).start()
-    server = ThreadingHTTPServer(("127.0.0.1", int(os.getenv("API_PORT", "8000"))), ApiHandler)
-    logger.info("API da LOJINHA KLUBI disponível em http://127.0.0.1:%s", server.server_address[1])
+    server = ThreadingHTTPServer((settings.api_host, settings.api_port), ApiHandler)
+    logger.info("API da LOJINHA KLUBI disponível em http://%s:%s", settings.api_host, server.server_address[1])
     try:
         server.serve_forever()
     except KeyboardInterrupt:

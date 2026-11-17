@@ -42,6 +42,8 @@ def _format_log_message(event: str, details: dict[str, Any]) -> str:
             "AJUSTE_MANUAL": f"Ajustei o estoque de {details.get('product_name', 'produto')}.",
             "RECONCILIACAO": f"Atualizei {details.get('product_name', 'produto')} de {details.get('old_quantity', '?')} para {details.get('new_quantity', '?')} unidade(s).",
             "DEVOLUCAO": f"Registrei uma devolução do pedido {order_id}.",
+            "FOTO_ATUALIZADA": f"Atualizei a foto de {details.get('product_name', 'produto')} na loja.",
+            "FOTO_REMOVIDA": f"Removi a foto de {details.get('product_name', 'produto')} da loja.",
             "SAIDA_NAO_COMERCIAL": f"Retirei {details.get('items_summary', 'itens')} para {details.get('reason_label', 'saída não comercial')} de {details.get('recipient', 'destinatário não informado')}.",
         }
         return labels.get(action, f"Registrei a ação {action or 'operacional'} no pedido {order_id}.")
@@ -262,19 +264,159 @@ def list_products(page: int = 1, page_size: int = 50, low_only: bool = False) ->
         where = "WHERE p.status = 'ATIVO'" + (" AND i.available_quantity <= CAST((SELECT value FROM settings WHERE key='stock_low_limit') AS INTEGER)" if low_only else "")
         total = connection.execute(f"SELECT COUNT(*) FROM products p JOIN inventory i ON i.product_id=p.id {where}").fetchone()[0]
         rows = connection.execute(f"SELECT p.*, i.physical_quantity, i.reserved_quantity, i.available_quantity, i.updated_at AS inventory_updated_at FROM products p JOIN inventory i ON i.product_id=p.id {where} ORDER BY p.name LIMIT ? OFFSET ?", (page_size, offset)).fetchall()
+        images = _image_urls(connection)
+        groups = _group_names(connection)
         data = []
         for row in rows:
             item = row_dict(row)
             item["unit_price"] = money(item.pop("unit_price_cents"))
             quantity = item["available_quantity"]
             item["situation"] = "Sem estoque" if quantity == 0 else "Estoque baixo" if quantity <= settings.stock_low_limit else "Em estoque"
+            item["group_name"] = groups.get(item["id"], item["base_name"])
+            item["image_url"] = images.get(normalize(item["group_name"]))
             data.append(item)
         return {"items": data, "page": page, "page_size": page_size, "total_items": total, "total_pages": (total + page_size - 1) // page_size}
 
 
 def list_store_products() -> dict:
-    data = list_products(1, 100, False)["items"]
-    return {"items": [{key: item[key] for key in ("id", "name", "base_name", "color", "size", "sku", "unit_price", "available_quantity", "situation")} for item in data]}
+    """Catálogo completo para a loja dos colaboradores (sem paginação, com foto)."""
+    with connect() as connection:
+        rows = connection.execute("SELECT p.id,p.name,p.base_name,p.description,p.color,p.size,p.sku,p.unit_price_cents,i.available_quantity FROM products p JOIN inventory i ON i.product_id=p.id WHERE p.status='ATIVO' ORDER BY p.base_name,p.id").fetchall()
+        images = _image_urls(connection)
+        groups = _group_names(connection)
+    items = []
+    for row in rows:
+        item = row_dict(row)
+        item["unit_price"] = money(item.pop("unit_price_cents"))
+        item["group_name"] = groups.get(item["id"], item["base_name"])
+        item["image_url"] = images.get(normalize(item["group_name"]))
+        items.append(item)
+    return {"items": items}
+
+
+# ---------- fotos dos produtos ----------
+
+IMAGE_MAX_BYTES = 3 * 1024 * 1024
+_IMAGE_NAME = re.compile(r"^[a-z0-9-]+\.(jpg|png|webp)$")
+IMAGE_TYPES = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+
+
+def _image_urls(connection) -> dict[str, str]:
+    return {row["base_key"]: f"/imagens/{row['file_name']}" for row in connection.execute("SELECT base_key,file_name FROM product_images")}
+
+
+def _image_extension(data: bytes) -> str | None:
+    """Identifica o formato pelo conteúdo do arquivo, não pelo nome."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _group_names(connection) -> dict[int, str]:
+    """Nome de vitrine de cada produto: o base_name, mais a cor quando o mesmo base_name
+    existe em mais de uma cor (ex.: "Moletom" branco e preto viram "Moletom Branco" e "Moletom Preto").
+    É a unidade que recebe foto e vira um cartão na loja."""
+    rows = connection.execute("SELECT id,base_name,color FROM products WHERE status='ATIVO'").fetchall()
+    colors: dict[str, set[str]] = {}
+    for row in rows:
+        colors.setdefault(normalize(row["base_name"]), set()).add(normalize(row["color"]))
+    names = {}
+    for row in rows:
+        color = str(row["color"] or "").strip()
+        several = len(colors[normalize(row["base_name"])]) > 1
+        names[row["id"]] = f"{row['base_name']} {color.title()}" if several and color else row["base_name"]
+    return names
+
+
+def _base_name_or_error(connection, base_name: str) -> str:
+    key = normalize(base_name)
+    for name in set(_group_names(connection).values()):
+        if normalize(name) == key:
+            return name
+    raise ProductNotFoundError("Produto não encontrado.")
+
+
+def list_product_images() -> dict:
+    """Um item por produto de vitrine, com a foto atual (ou nenhuma) e quantos tamanhos ele tem."""
+    with connect() as connection:
+        groups = _group_names(connection)
+        images = _image_urls(connection)
+    grouped: dict[str, dict] = {}
+    for name in groups.values():
+        key = normalize(name)
+        entry = grouped.setdefault(key, {"base_name": name, "variations": 0, "image_url": images.get(key)})
+        entry["variations"] += 1
+    return {"items": sorted(grouped.values(), key=lambda item: normalize(item["base_name"]))}
+
+
+def save_product_image(base_name: str, image_base64: str) -> dict:
+    import base64
+    import binascii
+    import secrets
+
+    raw = str(image_base64 or "")
+    if raw.startswith("data:"):
+        raw = raw.split(",", 1)[-1]
+    if len(raw) > IMAGE_MAX_BYTES * 4 // 3 + 8:
+        raise ValueError("A foto deve ter no máximo 3 MB.")
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("Não foi possível ler a foto enviada.") from error
+    if not data:
+        raise ValueError("Selecione uma foto.")
+    if len(data) > IMAGE_MAX_BYTES:
+        raise ValueError("A foto deve ter no máximo 3 MB.")
+    extension = _image_extension(data)
+    if not extension:
+        raise ValueError("Envie a foto em JPG, PNG ou WebP.")
+
+    with transaction(immediate=True) as connection:
+        canonical = _base_name_or_error(connection, base_name)
+        key = normalize(canonical)
+        previous = connection.execute("SELECT file_name FROM product_images WHERE base_key=?", (key,)).fetchone()
+        file_name = f"{re.sub(r'[^a-z0-9]+', '-', key.lower()).strip('-') or 'produto'}-{secrets.token_hex(4)}.{extension}"
+        settings.images_dir.mkdir(parents=True, exist_ok=True)
+        (settings.images_dir / file_name).write_bytes(data)
+        try:
+            connection.execute(
+                "INSERT INTO product_images(base_key,base_name,file_name,updated_at) VALUES (?,?,?,?) ON CONFLICT(base_key) DO UPDATE SET base_name=excluded.base_name,file_name=excluded.file_name,updated_at=excluded.updated_at",
+                (key, canonical, file_name, utc_now()),
+            )
+            _audit(connection, "PRODUCT_IMAGE", key, "FOTO_ATUALIZADA", {"file_name": previous["file_name"]} if previous else None, {"product_name": canonical, "file_name": file_name})
+        except Exception:
+            (settings.images_dir / file_name).unlink(missing_ok=True)
+            raise
+    if previous:
+        (settings.images_dir / previous["file_name"]).unlink(missing_ok=True)
+    return {"base_name": canonical, "image_url": f"/imagens/{file_name}"}
+
+
+def remove_product_image(base_name: str) -> dict:
+    with transaction(immediate=True) as connection:
+        canonical = _base_name_or_error(connection, base_name)
+        key = normalize(canonical)
+        previous = connection.execute("SELECT file_name FROM product_images WHERE base_key=?", (key,)).fetchone()
+        if previous:
+            connection.execute("DELETE FROM product_images WHERE base_key=?", (key,))
+            _audit(connection, "PRODUCT_IMAGE", key, "FOTO_REMOVIDA", {"file_name": previous["file_name"]}, {"product_name": canonical})
+    if previous:
+        (settings.images_dir / previous["file_name"]).unlink(missing_ok=True)
+    return {"base_name": canonical, "image_url": None}
+
+
+def product_image_file(file_name: str) -> tuple[Path, str] | None:
+    """Caminho seguro de uma foto salva; None se o nome for inválido ou o arquivo não existir."""
+    if not _IMAGE_NAME.fullmatch(file_name or ""):
+        return None
+    path = settings.images_dir / file_name
+    if not path.is_file():
+        return None
+    return path, IMAGE_TYPES[file_name.rsplit(".", 1)[1]]
 
 
 def create_store_order(items: list[dict], identity: dict) -> dict:
