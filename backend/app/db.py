@@ -168,6 +168,15 @@ CREATE TABLE IF NOT EXISTS monthly_closures (
     updated_at TEXT NOT NULL
 );
 
+-- Uma foto por produto-base (ex.: "Camiseta Preta"), compartilhada por todos os tamanhos.
+-- base_key é o base_name normalizado (sem acento, maiúsculo), para não depender de grafia.
+CREATE TABLE IF NOT EXISTS product_images (
+    base_key TEXT PRIMARY KEY,
+    base_name TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_base_name ON products(base_name);
 CREATE INDEX IF NOT EXISTS idx_inventory_product ON inventory(product_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);

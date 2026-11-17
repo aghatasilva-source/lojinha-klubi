@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 import threading
 import unittest
@@ -8,14 +9,14 @@ from pathlib import Path
 
 from backend.app import db, services
 from backend.app.config import settings as default_settings
-from backend.app.errors import InsufficientStockError, InvalidOrderStatusError
+from backend.app.errors import InsufficientStockError, InvalidOrderStatusError, ProductNotFoundError
 
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp.name) / "test.db"
-        test_settings = replace(default_settings, root=Path(self.temp.name), database_path=self.db_path, pedidos_concluidos_xlsx=Path(self.temp.name) / "concluidos.xlsx")
+        test_settings = replace(default_settings, root=Path(self.temp.name), database_path=self.db_path, pedidos_concluidos_xlsx=Path(self.temp.name) / "concluidos.xlsx", images_dir=Path(self.temp.name) / "imagens")
         db.settings = test_settings
         services.settings = test_settings
         db.initialize()
@@ -145,6 +146,64 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(results.count("ok"), 1)
         self.assertEqual(len(errors), 1)
 
+
+    # ---------- fotos dos produtos ----------
+
+    PNG = base64.b64encode(bytes.fromhex("89504e470d0a1a0a") + b"0" * 64).decode()
+
+    def test_foto_vale_para_todos_os_tamanhos_e_aparece_na_loja(self):
+        with db.transaction(immediate=True) as connection:
+            now = db.utc_now()
+            other = connection.execute("INSERT INTO products(sku,name,base_name,size,source_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", ("TEST-2", "Camiseta Branca - M", "Camiseta Branca", "M", "test:2", now, now)).lastrowid
+            connection.execute("INSERT INTO inventory(product_id,physical_quantity,updated_at) VALUES (?,?,?)", (other, 0, now))
+        result = services.save_product_image("camiseta branca", "data:image/png;base64," + self.PNG)
+        self.assertEqual(result["base_name"], "Camiseta Branca")
+        self.assertTrue(result["image_url"].startswith("/imagens/camiseta-branca-"))
+        store = services.list_store_products()["items"]
+        self.assertEqual({item["image_url"] for item in store}, {result["image_url"]})
+        self.assertEqual({item["size"] for item in store}, {"P", "M"})
+        self.assertIsNotNone(services.product_image_file(result["image_url"].rsplit("/", 1)[1]))
+
+    def test_trocar_foto_apaga_a_anterior(self):
+        first = services.save_product_image("Camiseta Branca", self.PNG)["image_url"].rsplit("/", 1)[1]
+        second = services.save_product_image("Camiseta Branca", self.PNG)["image_url"].rsplit("/", 1)[1]
+        self.assertNotEqual(first, second)
+        self.assertIsNone(services.product_image_file(first))
+        self.assertIsNotNone(services.product_image_file(second))
+        self.assertEqual(len(services.list_product_images()["items"]), 1)
+
+    def test_remover_foto(self):
+        file_name = services.save_product_image("Camiseta Branca", self.PNG)["image_url"].rsplit("/", 1)[1]
+        services.remove_product_image("Camiseta Branca")
+        self.assertIsNone(services.product_image_file(file_name))
+        self.assertIsNone(services.list_product_images()["items"][0]["image_url"])
+
+    def test_foto_rejeita_arquivo_que_nao_e_imagem_e_produto_inexistente(self):
+        with self.assertRaises(ValueError):
+            services.save_product_image("Camiseta Branca", base64.b64encode(b"<svg onload=alert(1)>").decode())
+        with self.assertRaises(ValueError):
+            services.save_product_image("Camiseta Branca", "isso nao e base64!")
+        with self.assertRaises(ProductNotFoundError):
+            services.save_product_image("Produto Fantasma", self.PNG)
+
+    def test_mesmo_produto_em_duas_cores_vira_dois_cartoes_com_fotos_separadas(self):
+        with db.transaction(immediate=True) as connection:
+            now = db.utc_now()
+            for sku, color in (("MOL-B", "BRANCO"), ("MOL-P", "PRETO")):
+                pid = connection.execute("INSERT INTO products(sku,name,base_name,color,size,source_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", (sku, "Moletom - P", "Moletom", color, "P", sku, now, now)).lastrowid
+                connection.execute("INSERT INTO inventory(product_id,physical_quantity,updated_at) VALUES (?,?,?)", (pid, 1, now))
+        names = {item["base_name"] for item in services.list_product_images()["items"]}
+        self.assertTrue({"Moletom Branco", "Moletom Preto"} <= names)
+        services.save_product_image("Moletom Preto", self.PNG)
+        store = {item["sku"]: item for item in services.list_store_products()["items"]}
+        self.assertIsNone(store["MOL-B"]["image_url"])
+        self.assertIsNotNone(store["MOL-P"]["image_url"])
+        self.assertEqual(store["MOL-P"]["group_name"], "Moletom Preto")
+        self.assertEqual(store["TEST-1"]["group_name"], "Camiseta Branca")
+
+    def test_nome_de_arquivo_de_foto_nao_sai_da_pasta(self):
+        for name in ("../test.db", "..%2Ftest.db", "foto.svg", "", "a/b.png"):
+            self.assertIsNone(services.product_image_file(name))
 
 if __name__ == "__main__":
     unittest.main()
